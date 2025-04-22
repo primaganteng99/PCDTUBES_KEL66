@@ -19,8 +19,9 @@ from pathlib import Path
 import tempfile
 import shutil
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, precision_score, recall_score, f1_score, accuracy_score
 import itertools
+from modules.shape_analysis import ShapeAnalyzer
 
 # Mengatur tampilan halaman Streamlit
 st.set_page_config(
@@ -220,8 +221,9 @@ def main():
     # Sidebar navigation
     st.sidebar.title("Navigasi")
     app_mode = st.sidebar.selectbox(
-        "Pilih Mode Aplikasi",
-        ["Beranda", "Preprocessing Dataset", "Deteksi Wajah", "Perbandingan Wajah", "Deteksi Suku/Etnis", "Tentang"]
+    "Pilih Mode Aplikasi",
+    ["Beranda", "Preprocessing Dataset", "Deteksi Wajah", "Perbandingan Wajah", 
+     "Deteksi Suku/Etnis", "Analisis Bentuk Wajah", "Tentang"]
     )
     
     # ========== HOME PAGE ==========
@@ -498,6 +500,130 @@ def main():
                     st.success(f"Kedua wajah kemungkinan berasal dari orang yang sama (skor kemiripan: {similarity:.4f} ≥ {threshold:.2f}).")
                 else:
                     st.warning(f"Kedua wajah kemungkinan berasal dari orang yang berbeda (skor kemiripan: {similarity:.4f} < {threshold:.2f}).")
+                    # Tambahkan checkbox untuk ROC curve analysis
+                if st.checkbox("Tampilkan Analisis ROC Curve"):
+                    st.subheader("Analisis ROC Curve")
+                    
+                    # Generate ROC curve dari image pairs
+                    with st.spinner("Menganalisis dataset untuk ROC curve..."):
+                        # Jika sudah ada data cropped_mtcnn dan ingin menggunakan data real
+                        if os.path.exists(CROPPED_DIR) and len(os.listdir(CROPPED_DIR)) > 0:
+                            # Buat pasangan gambar
+                            df_pairs = generate_image_pairs(str(CROPPED_DIR))
+                            
+                            # Hitung similarity untuk setiap pasangan
+                            similarities = []
+                            progress_bar = st.progress(0)
+                            
+                            for i, (_, row) in enumerate(df_pairs.iterrows()):
+                                img1_path = os.path.join(CROPPED_DIR, row['img1'])
+                                img2_path = os.path.join(CROPPED_DIR, row['img2'])
+                                
+                                if os.path.exists(img1_path) and os.path.exists(img2_path):
+                                    img1 = cv2.imread(str(img1_path))
+                                    img2 = cv2.imread(str(img2_path))
+                                    
+                                    sim = calculate_similarity(img1, img2, face_model)
+                                    similarities.append(sim)
+                                else:
+                                    similarities.append(None)
+                                
+                                progress_bar.progress((i + 1) / len(df_pairs))
+                            
+                            # Update dataframe
+                            df_pairs['proba'] = similarities
+                            
+                            # Prepare data for ROC curve
+                            y_true = df_pairs['actual'].map({'Yes': 1, 'No': 0})
+                            y_scores = df_pairs['proba'].dropna()
+                            
+                            # Plot ROC curve
+                            fig, ax = plt.subplots(figsize=(8, 6))
+                            
+                            # Calculate ROC curve
+                            fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+                            roc_auc = auc(fpr, tpr)
+                            
+                            # Plot ROC curve
+                            ax.plot(fpr, tpr, color='blue', label=f'ROC Curve (AUC = {roc_auc:.2f})')
+                            
+                            # Find optimal threshold
+                            from sklearn.metrics import f1_score
+                            f1_scores = [f1_score(y_true, y_scores >= t) for t in thresholds]
+                            optimal_idx = np.argmax(f1_scores)
+                            optimal_threshold = thresholds[optimal_idx]
+                            
+                            # Highlight optimal threshold
+                            ax.scatter(fpr[optimal_idx], tpr[optimal_idx], color='red', 
+                                      label=f'Optimal Threshold = {optimal_threshold:.2f}')
+                            
+                            ax.plot([0, 1], [0, 1], linestyle='--', color='gray')
+                            ax.set_xlabel('False Positive Rate')
+                            ax.set_ylabel('True Positive Rate')
+                            ax.set_title('ROC Curve + Optimal Threshold')
+                            ax.legend()
+                            ax.grid(True)
+                            
+                            st.pyplot(fig)
+                            
+                            # Metrics
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("AUC", f"{roc_auc:.4f}")
+                            col2.metric("Optimal Threshold", f"{optimal_threshold:.4f}")
+                            
+                            # Calculate metrics at optimal threshold
+                            y_pred_optimal = (y_scores >= optimal_threshold).astype(int)
+                            from sklearn.metrics import accuracy_score, precision_score, recall_score
+                            accuracy = accuracy_score(y_true, y_pred_optimal)
+                            precision = precision_score(y_true, y_pred_optimal)
+                            recall = recall_score(y_true, y_pred_optimal)
+                            
+                            col3.metric("Accuracy", f"{accuracy:.4f}")
+                            
+                            # More metrics
+                            st.markdown("##### Detailed Metrics at Optimal Threshold")
+                            metric_col1, metric_col2, metric_col3 = st.columns(3)
+                            metric_col1.metric("Precision", f"{precision:.4f}")
+                            metric_col2.metric("Recall", f"{recall:.4f}")
+                            metric_col3.metric("F1 Score", f"{f1_scores[optimal_idx]:.4f}")
+                            
+                            # Interpretasi
+                            st.info(f"""
+                            **Hasil Analisis ROC Curve:**
+                            - **AUC (Area Under Curve)**: {roc_auc:.4f} - Semakin tinggi nilainya (mendekati 1), semakin baik model membedakan wajah yang sama dan berbeda
+                            - **Optimal Threshold**: {optimal_threshold:.4f} - Threshold ini memberikan keseimbangan terbaik antara True Positive Rate dan False Positive Rate
+                            
+                            Anda dapat menyesuaikan threshold perbandingan wajah ke nilai optimal ({optimal_threshold:.4f}) untuk hasil terbaik.
+                            """)
+                        else:
+                            # Jika tidak ada data, gunakan data dummy
+                            st.warning("Data wajah belum diproses. Gunakan fitur 'Preprocessing Dataset' terlebih dahulu.")
+                            
+                            # Tampilkan contoh ROC curve dengan data dummy
+                            y_true = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+                            y_scores = np.array([0.1, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.99])
+                            
+                            # Plot ROC curve
+                            fig, ax = plt.subplots(figsize=(8, 6))
+                            
+                            # Calculate ROC curve
+                            fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+                            roc_auc = auc(fpr, tpr)
+                            
+                            # Plot the curve
+                            ax.plot(fpr, tpr, color='blue', label=f'ROC Curve (AUC = {roc_auc:.2f})')
+                            ax.plot([0, 1], [0, 1], linestyle='--', color='gray')
+                            ax.set_xlabel('False Positive Rate')
+                            ax.set_ylabel('True Positive Rate')
+                            ax.set_title('ROC Curve (Example)')
+                            ax.legend()
+                            ax.grid(True)
+                            
+                            st.pyplot(fig)
+                            
+                            st.info("Ini adalah contoh ROC curve. Untuk mendapatkan ROC curve dari dataset Anda, gunakan fitur 'Preprocessing Dataset' terlebih dahulu.")
+
+                
     
     # ========== ETHNIC DETECTION PAGE ==========
     elif app_mode == "Deteksi Suku/Etnis":
@@ -529,6 +655,8 @@ def main():
             
             if st.button("Latih Model"):
                 import torch
+                from torch import nn
+                from torchvision import models
                 import torchvision
                 import albumentations as A
                 from albumentations.pytorch import ToTensorV2
@@ -739,6 +867,10 @@ def main():
             if not model_path.exists():
                 st.warning("Model belum dilatih. Silakan latih model terlebih dahulu pada tab Training.")
             else:
+                import torch 
+                from torch import nn
+                from torchvision import models, transforms
+    
                 # Load model
                 model = models.resnet18(pretrained=False)
                 model.fc = nn.Linear(model.fc.in_features, 3)  # 3 kelas: Jawa, Batak, Sunda
@@ -823,6 +955,126 @@ def main():
                         else:
                             st.warning(f"Sistem tidak dapat memprediksi suku dengan confidence yang tinggi. Confidence tertinggi adalah {predicted_class} ({max_confidence:.2f}).")
     
+    elif app_mode == "Analisis Bentuk Wajah":
+        st.header("Analisis Bentuk Wajah Menggunakan Metode Komputer Vision")
+        
+        st.write("""
+        Fitur ini memungkinkan analisis lebih mendalam terhadap bentuk wajah menggunakan metode:
+        1. **Kode Rantai (Chain Code)** - Merepresentasikan kontur wajah sebagai rangkaian arah
+        2. **Deteksi Tepi (Edge Detection)** - Mengekstraksi tepi-tepi signifikan pada wajah
+        3. **Proyeksi Integral** - Menganalisis distribusi piksel untuk karakterisasi bentuk
+        """)
+        
+        # Inisialisasi analyzer
+        shape_analyzer = ShapeAnalyzer()
+        
+        # Upload image
+        uploaded_file = st.file_uploader("Upload gambar wajah", type=["jpg", "jpeg", "png"])
+        
+        if uploaded_file is not None:
+            # Read image
+            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            
+            # Create tabs for different analyses
+            tab1, tab2, tab3 = st.tabs(["Analisis Kontur", "Deteksi Tepi", "Proyeksi Integral"])
+            
+            with tab1:
+                st.subheader("Analisis Kontur Wajah dengan Kode Rantai")
+                
+                # Detect face first using existing detector
+                detector = load_face_detector()
+                img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                faces = detector.detect_faces(img_rgb)
+                
+                if faces:
+                    face = faces[0]
+                    x, y, w, h = face['box']
+                    face_img = image[y:y+h, x:x+w]
+                    
+                    # Show original face
+                    st.image(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB), caption="Wajah Terdeteksi")
+                    
+                    # Generate contour visualization
+                    with st.spinner("Menganalisis kontur wajah..."):
+                        fig = shape_analyzer.visualize_contour_analysis(face_img)
+                        st.pyplot(fig)
+                        
+                    # Show shape metrics
+                    metrics = shape_analyzer.analyze_facial_shape(face_img)
+                    st.write("### Metrik Bentuk Wajah")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Aspect Ratio", f"{metrics['aspect_ratio']:.3f}")
+                        st.metric("Circularity", f"{metrics['circularity']:.3f}")
+                    
+                    with col2:
+                        st.metric("Convexity", f"{metrics['convexity']:.3f}")
+                        st.metric("Area", f"{metrics['area']:.0f} piksel²")
+                else:
+                    st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
+            
+            with tab2:
+                st.subheader("Deteksi Tepi Wajah dengan Canny Edge Detection")
+                
+                # Parameters for Canny
+                low_threshold = st.slider("Threshold Bawah", 0, 255, 50)
+                high_threshold = st.slider("Threshold Atas", 0, 255, 150)
+                
+                # Detect face
+                detector = load_face_detector()
+                img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                faces = detector.detect_faces(img_rgb)
+                
+                if faces:
+                    face = faces[0]
+                    x, y, w, h = face['box']
+                    face_img = image[y:y+h, x:x+w]
+                    
+                    # Generate edge visualization
+                    with st.spinner("Mendeteksi tepi wajah..."):
+                        fig = shape_analyzer.visualize_edges(face_img, low_threshold, high_threshold)
+                        st.pyplot(fig)
+                    
+                    # Explanation
+                    st.info("""
+                    **Tentang Deteksi Tepi Canny:**
+                    - **Threshold Bawah**: Pixel dengan gradient di bawah nilai ini tidak dianggap sebagai tepi
+                    - **Threshold Atas**: Pixel dengan gradient di atas nilai ini selalu dianggap sebagai tepi
+                    - Pixel antara kedua threshold ini dianggap tepi jika terhubung dengan tepi yang pasti
+                    """)
+                else:
+                    st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
+            
+            with tab3:
+                st.subheader("Analisis Proyeksi Integral Wajah")
+                
+                # Detect face
+                detector = load_face_detector()
+                img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                faces = detector.detect_faces(img_rgb)
+                
+                if faces:
+                    face = faces[0]
+                    x, y, w, h = face['box']
+                    face_img = image[y:y+h, x:x+w]
+                    
+                    # Generate projections visualization
+                    with st.spinner("Menghitung proyeksi integral..."):
+                        fig = shape_analyzer.visualize_projections(face_img)
+                        st.pyplot(fig)
+                    
+                    # Explanation
+                    st.info("""
+                    **Tentang Proyeksi Integral:**
+                    - **Proyeksi Horizontal**: Menunjukkan distribusi piksel sepanjang sumbu X (fitur vertikal)
+                    - **Proyeksi Vertikal**: Menunjukkan distribusi piksel sepanjang sumbu Y (fitur horizontal)
+                    - Berguna untuk mengidentifikasi garis-garis fitur utama pada wajah
+                    """)
+                else:
+                    st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
+
     # ========== ABOUT PAGE ==========
     elif app_mode == "Tentang":
         st.header("Tentang Sistem")
