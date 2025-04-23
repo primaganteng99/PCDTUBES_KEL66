@@ -1,6 +1,6 @@
 """
 Sistem Pengenalan Wajah dan Deteksi Suku Menggunakan Computer Vision
-Aplikasi Streamlit dengan fitur preprocessing otomatis
+Aplikasi Streamlit dengan fitur preprocessing otomatis dan deteksi etnis
 """
 import os
 import cv2
@@ -12,16 +12,18 @@ import seaborn as sns
 from PIL import Image
 import torch
 from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from torch import nn, optim
 import time
 from pathlib import Path
 import tempfile
 import shutil
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc, precision_score, recall_score, f1_score, accuracy_score
 import itertools
 from modules.shape_analysis import ShapeAnalyzer
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 # Mengatur tampilan halaman Streamlit
 st.set_page_config(
@@ -36,10 +38,11 @@ BASE_DIR = Path.cwd()
 DATA_DIR = BASE_DIR / "data"
 RAW_DIR = DATA_DIR / "raw"
 CROPPED_DIR = DATA_DIR / "cropped_mtcnn"
+ALIGNED_DIR = DATA_DIR / "aligned_faces"
 MODELS_DIR = BASE_DIR / "models"
 
 # Membuat direktori jika belum ada
-for directory in [DATA_DIR, RAW_DIR, CROPPED_DIR, MODELS_DIR]:
+for directory in [DATA_DIR, RAW_DIR, CROPPED_DIR, ALIGNED_DIR, MODELS_DIR]:
     directory.mkdir(exist_ok=True, parents=True)
 
 # Dictionary mapping nama orang ke etnis (hardcoded dari dataset)
@@ -61,6 +64,33 @@ ETHNICITY_MAPPING = {
     'Tian': 'batak',
 }
 
+# Fungsi untuk create consistent transforms
+def create_consistent_transforms():
+    """Membuat transformasi konsisten untuk training dan inferensi"""
+    normalize_transform = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406], 
+        std=[0.229, 0.224, 0.225]
+    )
+    
+    # Transformasi dasar untuk inferensi/testing
+    inference_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        normalize_transform
+    ])
+    
+    # Transformasi untuk training (dengan augmentasi)
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.1),
+        transforms.ToTensor(),
+        normalize_transform,
+    ])
+    
+    return inference_transform, train_transform
+
 # Fungsi untuk load modul (lazy loading)
 @st.cache_resource
 def load_face_detector():
@@ -73,6 +103,65 @@ def load_face_similarity_model():
     return InceptionResnetV1(pretrained='vggface2').eval()
 
 # Fungsi preprocessing gambar
+def align_face(face_img, keypoints):
+    """Align face based on eye landmarks"""
+    # Get eye coordinates
+    left_eye = keypoints['left_eye']
+    right_eye = keypoints['right_eye']
+    
+    # Calculate angle between eyes
+    dx = right_eye[0] - left_eye[0]
+    dy = right_eye[1] - left_eye[1]
+    angle = np.degrees(np.arctan2(dy, dx))
+    
+    # Get center between eyes
+    eye_center = ((left_eye[0] + right_eye[0]) // 2, 
+                  (left_eye[1] + right_eye[1]) // 2)
+    
+    # Define rotation matrix
+    M = cv2.getRotationMatrix2D(eye_center, angle, scale=1.0)
+    
+    # Get image dimensions
+    h, w = face_img.shape[:2]
+    
+    # Apply rotation
+    aligned_face = cv2.warpAffine(face_img, M, (w, h), 
+                                 flags=cv2.INTER_CUBIC, 
+                                 borderMode=cv2.BORDER_CONSTANT)
+    
+    return aligned_face
+
+def detect_crop_and_align_face(image, detector):
+    """Detect, crop and align face in one step"""
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if len(image.shape) == 3 else image
+    
+    # Detect faces
+    faces = detector.detect_faces(img_rgb)
+    
+    if not faces:
+        return None, None
+    
+    face = faces[0]
+    x, y, w, h = face['box']
+    
+    # Add margin (20%)
+    margin_x = int(w * 0.2)
+    margin_y = int(h * 0.2)
+    
+    # Calculate new coordinates with margin, ensuring they're within image bounds
+    x1 = max(0, x - margin_x)
+    y1 = max(0, y - margin_y)
+    x2 = min(img_rgb.shape[1], x + w + margin_x)
+    y2 = min(img_rgb.shape[0], y + h + margin_y)
+    
+    # Crop face with margin
+    face_crop = image[y1:y2, x1:x2]
+    
+    # Align face using landmarks
+    aligned_face = align_face(face_crop, face['keypoints'])
+    
+    return aligned_face, face
+
 def detect_and_crop_faces(image_path, detector, output_folder):
     """Deteksi dan crop wajah dari gambar"""
     img = cv2.imread(str(image_path))
@@ -103,7 +192,7 @@ def detect_and_crop_faces(image_path, detector, output_folder):
 
 def preprocess_face(face_img, target_size=(160, 160)):
     """Preprocess wajah untuk model FaceNet"""
-    face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+    face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB) if len(face_img.shape) == 3 else face_img
     resized = cv2.resize(face_rgb, target_size)
     tensor = torch.tensor(resized).permute(2, 0, 1).float() / 255.0
     return tensor.unsqueeze(0)
@@ -208,6 +297,75 @@ def plot_roc_curve(y_true, y_scores):
     
     return fig, optimal_threshold
 
+# Fungsi untuk inisialisasi model dengan arsitektur yang ditingkatkan
+def initialize_ethnic_model(num_classes=3, dropout_rate=0.5):
+    """Inisialisasi model deteksi etnis dengan arsitektur yang ditingkatkan"""
+    model = models.resnet18(pretrained=True)
+    
+    # Unfreeze beberapa layer terakhir untuk fine-tuning
+    for param in model.layer4.parameters():
+        param.requires_grad = True
+    
+    # Ganti fully connected layer dengan sequential yang lebih kompleks
+    in_features = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.BatchNorm1d(in_features),
+        nn.Dropout(dropout_rate),
+        nn.Linear(in_features, 512),
+        nn.ReLU(),
+        nn.BatchNorm1d(512),
+        nn.Dropout(dropout_rate),
+        nn.Linear(512, num_classes)
+    )
+    
+    return model
+
+# Class untuk albumentations transform
+class AlbumentationsTransform:
+    """Class untuk mengaplikasikan transformasi Albumentations pada dataset PyTorch"""
+    def __init__(self, transform):
+        self.transform = transform
+    
+    def __call__(self, img):
+        # Convert PIL image to NumPy array
+        image_np = np.array(img)
+        
+        # Apply Albumentations transform
+        augmented = self.transform(image=image_np)
+        image = augmented['image']
+        
+        return image
+
+def create_augmentation_transforms():
+    """Create transformations dengan augmentasi yang lebih agresif"""
+    # Transform for training with heavy augmentation
+    train_transform = AlbumentationsTransform(
+        A.Compose([
+            A.Resize(224, 224),
+            A.Rotate(limit=30, p=0.8),  # Lebih agresif
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
+            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=20, p=0.7),
+            A.MotionBlur(blur_limit=5, p=0.3),
+            A.GaussianBlur(blur_limit=5, p=0.2),
+            A.GaussNoise(var_limit=(10, 50), p=0.2),
+            A.GridDistortion(p=0.2),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+    )
+    
+    # Transform for validation and testing
+    val_test_transform = AlbumentationsTransform(
+        A.Compose([
+            A.Resize(224, 224),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+    )
+    
+    return train_transform, val_test_transform
+
 # Komponen UI utama
 def main():
     st.title("Sistem Pengenalan Wajah dan Deteksi Suku")
@@ -252,6 +410,10 @@ def main():
         ### Langkah 4: Deteksi Suku/Etnis
         - Upload gambar wajah untuk memprediksi suku/etnis
         - Model akan menklasifikasikan ke kategori Jawa, Batak, atau Sunda
+        
+        ### Langkah 5: Analisis Bentuk Wajah
+        - Upload gambar untuk melakukan analisis bentuk wajah
+        - Lihat karakteristik bentuk wajah yang berkorelasi dengan etnis
         """)
     
     # ========== PREPROCESSING PAGE ==========
@@ -262,8 +424,9 @@ def main():
         st.write("Dataset akan diproses melalui tahapan berikut:")
         st.markdown("""
         1. **Deteksi & Cropping Wajah** - Menggunakan MTCNN pada seluruh gambar di folder `data/raw`
-        2. **Pemisahan Dataset** - Membagi data menjadi Train/Val/Test berdasarkan etnis
-        3. **Augmentasi Data** - Melakukan augmentasi data (untuk training)
+        2. **Alignment Wajah** - Menyelaraskan wajah berdasarkan landmark mata
+        3. **Pemisahan Dataset** - Membagi data menjadi Train/Val/Test berdasarkan etnis
+        4. **Augmentasi Data** - Melakukan augmentasi data (untuk training)
         """)
         
         # Tampilkan contoh gambar dari folder raw
@@ -287,7 +450,7 @@ def main():
         
         # Button untuk memulai preprocessing
         if st.button("Mulai Preprocessing Dataset"):
-            with st.spinner('Mendeteksi dan Crop Wajah...'):
+            with st.spinner('Mendeteksi, Crop, dan Align Wajah...'):
                 # Deteksi dan crop wajah dengan MTCNN
                 detector = load_face_detector()
                 
@@ -302,7 +465,7 @@ def main():
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                # Crop wajah
+                # Crop dan align wajah
                 cropped_faces = []
                 for i, img_path in enumerate(raw_images):
                     status_text.text(f"Processing {os.path.basename(img_path)}...")
@@ -311,7 +474,7 @@ def main():
                         cropped_faces.append(face_path)
                     progress_bar.progress((i + 1) / len(raw_images))
                 
-                status_text.text(f"Selesai cropping {len(cropped_faces)} wajah dari {len(raw_images)} gambar")
+                status_text.text(f"Selesai cropping dan alignment {len(cropped_faces)} wajah dari {len(raw_images)} gambar")
             
             with st.spinner('Memisahkan Dataset...'):
                 # Split dataset ke Train/Val/Test
@@ -338,7 +501,7 @@ def main():
             
             # Opsi untuk melihat hasil cropping
             if st.checkbox("Lihat Hasil Cropping"):
-                st.subheader("Hasil Cropping Wajah")
+                st.subheader("Hasil Cropping dan Alignment Wajah")
                 
                 # Ambil beberapa contoh hasil crop
                 sample_cropped = []
@@ -409,6 +572,19 @@ def main():
                     face_img = image[y:y+h, x:x+w]
                     col.image(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB), caption=f"Wajah {i+1}")
                     col.metric("Confidence", f"{face['confidence']:.2f}")
+                
+                # Show aligned face
+                if st.checkbox("Tampilkan Wajah yang Disejajarkan (Aligned)"):
+                    st.subheader("Hasil Alignment Wajah")
+                    
+                    face = faces[0]
+                    aligned_face, _ = detect_crop_and_align_face(image, detector)
+                    
+                    if aligned_face is not None:
+                        st.image(cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB), caption="Wajah Aligned")
+                        st.success("Alignment berhasil dilakukan berdasarkan landmark mata")
+                    else:
+                        st.error("Tidak dapat melakukan alignment wajah")
     
     # ========== FACE SIMILARITY PAGE ==========
     elif app_mode == "Perbandingan Wajah":
@@ -454,35 +630,23 @@ def main():
             col1.image(cv2.cvtColor(image1, cv2.COLOR_BGR2RGB))
             col2.image(cv2.cvtColor(image2, cv2.COLOR_BGR2RGB))
             
-            # Detect faces
-            with st.spinner("Mendeteksi wajah..."):
-                img_rgb1 = cv2.cvtColor(image1, cv2.COLOR_BGR2RGB)
-                img_rgb2 = cv2.cvtColor(image2, cv2.COLOR_BGR2RGB)
-                faces1 = detector.detect_faces(img_rgb1)
-                faces2 = detector.detect_faces(img_rgb2)
+            # Detect and align faces
+            with st.spinner("Mendeteksi dan menyelaraskan wajah..."):
+                aligned_face1, face_data1 = detect_crop_and_align_face(image1, detector)
+                aligned_face2, face_data2 = detect_crop_and_align_face(image2, detector)
             
-            if not faces1 or not faces2:
+            if aligned_face1 is None or aligned_face2 is None:
                 st.error("Tidak dapat mendeteksi wajah pada salah satu atau kedua gambar. Silakan coba gambar lain.")
             else:
-                # Get first face from each image
-                face1_box = faces1[0]['box']
-                face2_box = faces2[0]['box']
-                
-                x1, y1, w1, h1 = face1_box
-                x2, y2, w2, h2 = face2_box
-                
-                face1_img = image1[y1:y1+h1, x1:x1+w1]
-                face2_img = image2[y2:y2+h2, x2:x2+w2]
-                
-                # Show cropped faces
-                st.subheader("Wajah Terdeteksi")
+                # Show aligned faces
+                st.subheader("Wajah Terdeteksi dan Disejajarkan")
                 display_col1, display_col2 = st.columns(2)
-                display_col1.image(cv2.cvtColor(face1_img, cv2.COLOR_BGR2RGB), caption="Wajah 1")
-                display_col2.image(cv2.cvtColor(face2_img, cv2.COLOR_BGR2RGB), caption="Wajah 2")
+                display_col1.image(cv2.cvtColor(aligned_face1, cv2.COLOR_BGR2RGB), caption="Wajah 1 (Aligned)")
+                display_col2.image(cv2.cvtColor(aligned_face2, cv2.COLOR_BGR2RGB), caption="Wajah 2 (Aligned)")
                 
                 # Calculate similarity
                 with st.spinner("Menghitung kemiripan..."):
-                    similarity = calculate_similarity(face1_img, face2_img, face_model)
+                    similarity = calculate_similarity(aligned_face1, aligned_face2, face_model)
                 
                 # Show similarity result
                 st.subheader("Hasil Perbandingan")
@@ -537,47 +701,30 @@ def main():
                             y_true = df_pairs['actual'].map({'Yes': 1, 'No': 0})
                             y_scores = df_pairs['proba'].dropna()
                             
-                            # Plot ROC curve
-                            fig, ax = plt.subplots(figsize=(8, 6))
+                            # Plot ROC curve and get optimal threshold
+                            fig, optimal_threshold = plot_roc_curve(y_true, y_scores)
+                            st.pyplot(fig)
+                            
+                            # Metrics
+                            col1, col2, col3 = st.columns(3)
                             
                             # Calculate ROC curve
                             fpr, tpr, thresholds = roc_curve(y_true, y_scores)
                             roc_auc = auc(fpr, tpr)
                             
-                            # Plot ROC curve
-                            ax.plot(fpr, tpr, color='blue', label=f'ROC Curve (AUC = {roc_auc:.2f})')
-                            
-                            # Find optimal threshold
-                            from sklearn.metrics import f1_score
+                            # Find optimal threshold and metrics
                             f1_scores = [f1_score(y_true, y_scores >= t) for t in thresholds]
                             optimal_idx = np.argmax(f1_scores)
                             optimal_threshold = thresholds[optimal_idx]
                             
-                            # Highlight optimal threshold
-                            ax.scatter(fpr[optimal_idx], tpr[optimal_idx], color='red', 
-                                      label=f'Optimal Threshold = {optimal_threshold:.2f}')
-                            
-                            ax.plot([0, 1], [0, 1], linestyle='--', color='gray')
-                            ax.set_xlabel('False Positive Rate')
-                            ax.set_ylabel('True Positive Rate')
-                            ax.set_title('ROC Curve + Optimal Threshold')
-                            ax.legend()
-                            ax.grid(True)
-                            
-                            st.pyplot(fig)
-                            
-                            # Metrics
-                            col1, col2, col3 = st.columns(3)
-                            col1.metric("AUC", f"{roc_auc:.4f}")
-                            col2.metric("Optimal Threshold", f"{optimal_threshold:.4f}")
-                            
                             # Calculate metrics at optimal threshold
                             y_pred_optimal = (y_scores >= optimal_threshold).astype(int)
-                            from sklearn.metrics import accuracy_score, precision_score, recall_score
                             accuracy = accuracy_score(y_true, y_pred_optimal)
                             precision = precision_score(y_true, y_pred_optimal)
                             recall = recall_score(y_true, y_pred_optimal)
                             
+                            col1.metric("AUC", f"{roc_auc:.4f}")
+                            col2.metric("Optimal Threshold", f"{optimal_threshold:.4f}")
                             col3.metric("Accuracy", f"{accuracy:.4f}")
                             
                             # More metrics
@@ -623,8 +770,6 @@ def main():
                             
                             st.info("Ini adalah contoh ROC curve. Untuk mendapatkan ROC curve dari dataset Anda, gunakan fitur 'Preprocessing Dataset' terlebih dahulu.")
 
-                
-    
     # ========== ETHNIC DETECTION PAGE ==========
     elif app_mode == "Deteksi Suku/Etnis":
         st.header("Deteksi Suku/Etnis dengan CNN")
@@ -649,17 +794,40 @@ def main():
             else:
                 st.success("Model sudah dilatih dan siap digunakan.")
             
-            # Opsi training
+            # Opsi training yang ditingkatkan
+            st.subheader("Konfigurasi Training")
             epochs = st.slider("Jumlah Epochs", min_value=5, max_value=50, value=20)
             batch_size = st.slider("Batch Size", min_value=8, max_value=64, value=32, step=8)
+            learning_rate = st.select_slider(
+                "Learning Rate",
+                options=[0.1, 0.01, 0.005, 0.001, 0.0005, 0.0001],
+                value=0.001,
+                format_func=lambda x: f"{x:.4f}"
+            )
+            dropout_rate = st.slider("Dropout Rate", min_value=0.0, max_value=0.7, value=0.5, step=0.1)
+            weight_decay = st.slider("Weight Decay", min_value=0.0, max_value=0.1, value=0.01, step=0.01)
+            
+            st.subheader("Teknik Training Lanjutan")
+            use_advanced = st.checkbox("Gunakan Teknik Lanjutan", value=True)
+            
+            if use_advanced:
+                col1, col2 = st.columns(2)
+                with col1:
+                    use_early_stopping = st.checkbox("Early Stopping", value=True)
+                    patience = st.slider("Patience", min_value=2, max_value=10, value=5) if use_early_stopping else 5
+                
+                with col2:
+                    use_lr_scheduler = st.checkbox("Learning Rate Scheduler", value=True)
+                    scheduler_factor = st.slider("Scheduler Factor", min_value=0.1, max_value=0.9, value=0.5) if use_lr_scheduler else 0.5
+            
+            use_cv = st.checkbox("Gunakan Cross-Validation (K-Fold)", value=False)
+            k_folds = st.slider("Jumlah Fold", min_value=3, max_value=10, value=5) if use_cv else 5
             
             if st.button("Latih Model"):
                 import torch
                 from torch import nn
                 from torchvision import models
                 import torchvision
-                import albumentations as A
-                from albumentations.pytorch import ToTensorV2
                 
                 # Cek ketersediaan data training
                 train_dir = DATA_DIR / "Train"
@@ -670,40 +838,7 @@ def main():
                     st.error("Data training/validasi/test belum disiapkan. Silakan lakukan preprocessing terlebih dahulu.")
                 else:
                     # Persiapkan transformasi gambar
-                    class AlbumentationsTransform:
-                        def __init__(self, transform):
-                            self.transform = transform
-                        
-                        def __call__(self, img):
-                            # Convert PIL image to NumPy array
-                            image_np = np.array(img)
-                            
-                            # Apply Albumentations transform
-                            augmented = self.transform(image=image_np)
-                            image = augmented['image']
-                            
-                            return image
-                    
-                    train_transform = AlbumentationsTransform(
-                        A.Compose([
-                            A.Resize(224, 224),
-                            A.Rotate(limit=15, p=0.8),
-                            A.HorizontalFlip(p=0.5),
-                            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.7),
-                            A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=10, p=0.5),
-                            A.MotionBlur(blur_limit=3, p=0.2),
-                            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                            ToTensorV2()
-                        ])
-                    )
-                    
-                    val_test_transform = AlbumentationsTransform(
-                        A.Compose([
-                            A.Resize(224, 224),
-                            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                            ToTensorV2()
-                        ])
-                    )
+                    train_transform, val_test_transform = create_augmentation_transforms()
                     
                     # Buat datasets
                     with st.spinner("Memuat dataset..."):
@@ -718,150 +853,353 @@ def main():
                         
                         st.info(f"Dataset dimuat: {len(train_dataset)} training, {len(val_dataset)} validasi, {len(test_dataset)} test")
                     
-                    # Inisialisasi model
-                    model = models.resnet18(pretrained=True)
-                    model.fc = nn.Linear(model.fc.in_features, 3)  # 3 kelas: Jawa, Batak, Sunda
-                    
-                    # Loss function dan optimizer
-                    criterion = nn.CrossEntropyLoss()
-                    optimizer = optim.Adam(model.parameters(), lr=0.001)
-                    
-                    # Training loop
-                    train_losses = []
-                    val_losses = []
-                    train_accs = []
-                    val_accs = []
-                    
-                    # Progress bar dan status
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    metrics_text = st.empty()
-                    loss_chart = st.empty()
-                    
-                    # Function to update loss chart
-                    def update_loss_chart(train_losses, val_losses, train_accs, val_accs):
-                        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+                    # Training
+                    if use_cv:
+                        st.subheader("Training dengan Cross-Validation")
                         
-                        ax1.plot(train_losses, label='Train Loss')
-                        ax1.plot(val_losses, label='Validation Loss')
-                        ax1.set_xlabel('Epochs')
-                        ax1.set_ylabel('Loss')
-                        ax1.set_title('Training and Validation Loss')
-                        ax1.legend()
-                        ax1.grid(True)
+                        # Setup k-fold cross validation
+                        from sklearn.model_selection import KFold
                         
-                        ax2.plot(train_accs, label='Train Accuracy')
-                        ax2.plot(val_accs, label='Validation Accuracy')
-                        ax2.set_xlabel('Epochs')
-                        ax2.set_ylabel('Accuracy')
-                        ax2.set_title('Training and Validation Accuracy')
-                        ax2.legend()
-                        ax2.grid(True)
+                        kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
                         
-                        return fig
-                    
-                    # Training loop
-                    for epoch in range(epochs):
-                        status_text.text(f"Epoch {epoch+1}/{epochs}")
+                        # Combine datasets for CV
+                        combined_dataset = torch.utils.data.ConcatDataset([train_dataset, val_dataset])
                         
-                        # Training phase
-                        model.train()
-                        running_train_loss = 0.0
-                        running_train_corrects = 0
-                        train_samples = 0
+                        # Metrics for CV
+                        cv_val_accs = []
+                        cv_models = []
                         
-                        for inputs, labels in train_loader:
-                            optimizer.zero_grad()
-                            outputs = model(inputs)
-                            loss = criterion(outputs, labels)
-                            loss.backward()
-                            optimizer.step()
+                        # Progress tracking
+                        fold_progress = st.progress(0)
+                        fold_text = st.empty()
+                        
+                        for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(len(combined_dataset)))):
+                            fold_text.text(f"Training fold {fold+1}/{k_folds}")
                             
-                            running_train_loss += loss.item() * inputs.size(0)
-                            _, preds = torch.max(outputs, 1)
-                            running_train_corrects += torch.sum(preds == labels.data)
-                            train_samples += labels.size(0)
+                            # Create samplers
+                            train_sampler = SubsetRandomSampler(train_idx)
+                            val_sampler = SubsetRandomSampler(val_idx)
+                            
+                            # Create loaders with samplers
+                            cv_train_loader = DataLoader(
+                                combined_dataset, batch_size=batch_size, sampler=train_sampler
+                            )
+                            cv_val_loader = DataLoader(
+                                combined_dataset, batch_size=batch_size, sampler=val_sampler
+                            )
+                            
+                            # Initialize model
+                            model = initialize_ethnic_model(num_classes=3, dropout_rate=dropout_rate)
+                            
+                            # Loss function and optimizer
+                            criterion = nn.CrossEntropyLoss()
+                            optimizer = optim.Adam(
+                                model.parameters(), 
+                                lr=learning_rate, 
+                                weight_decay=weight_decay
+                            )
+                            
+                            # Learning rate scheduler
+                            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                                optimizer, 'min', patience=2, factor=scheduler_factor
+                            ) if use_lr_scheduler else None
+                            
+                            # Training metrics
+                            best_val_acc = 0.0
+                            best_model_weights = None
+                            
+                            # Training loop for this fold
+                            for epoch in range(epochs):
+                                # Training phase
+                                model.train()
+                                running_train_loss = 0.0
+                                running_train_corrects = 0
+                                train_samples = 0
+                                
+                                for inputs, labels in cv_train_loader:
+                                    optimizer.zero_grad()
+                                    outputs = model(inputs)
+                                    loss = criterion(outputs, labels)
+                                    loss.backward()
+                                    optimizer.step()
+                                    
+                                    running_train_loss += loss.item() * inputs.size(0)
+                                    _, preds = torch.max(outputs, 1)
+                                    running_train_corrects += torch.sum(preds == labels.data)
+                                    train_samples += labels.size(0)
+                                
+                                epoch_train_loss = running_train_loss / train_samples
+                                epoch_train_acc = running_train_corrects.double() / train_samples
+                                
+                                # Validation phase
+                                model.eval()
+                                running_val_loss = 0.0
+                                running_val_corrects = 0
+                                val_samples = 0
+                                
+                                with torch.no_grad():
+                                    for inputs, labels in cv_val_loader:
+                                        outputs = model(inputs)
+                                        loss = criterion(outputs, labels)
+                                        
+                                        running_val_loss += loss.item() * inputs.size(0)
+                                        _, preds = torch.max(outputs, 1)
+                                        running_val_corrects += torch.sum(preds == labels.data)
+                                        val_samples += labels.size(0)
+                                
+                                epoch_val_loss = running_val_loss / val_samples
+                                epoch_val_acc = running_val_corrects.double() / val_samples
+                                
+                                # Update scheduler if used
+                                if scheduler:
+                                    scheduler.step(epoch_val_loss)
+                                
+                                # Save best model for this fold
+                                if epoch_val_acc > best_val_acc:
+                                    best_val_acc = epoch_val_acc
+                                    best_model_weights = model.state_dict().copy()
+                            
+                            # Store best accuracy for this fold
+                            cv_val_accs.append(best_val_acc.item())
+                            
+                            # Store best model from this fold
+                            if best_model_weights:
+                                model.load_state_dict(best_model_weights)
+                                cv_models.append(model)
+                            
+                            # Update fold progress
+                            fold_progress.progress((fold + 1) / k_folds)
                         
-                        epoch_train_loss = running_train_loss / train_samples
-                        epoch_train_acc = running_train_corrects.double() / train_samples
+                        # Show CV results
+                        mean_acc = np.mean(cv_val_accs)
+                        std_acc = np.std(cv_val_accs)
                         
-                        # Validation phase
-                        model.eval()
-                        running_val_loss = 0.0
-                        running_val_corrects = 0
-                        val_samples = 0
+                        st.success(f"Cross-Validation Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
+                        
+                        # Get best model from CV
+                        best_fold = np.argmax(cv_val_accs)
+                        best_model = cv_models[best_fold]
+                        
+                        # Save best model
+                        torch.save(best_model.state_dict(), str(model_path))
+                        st.success(f"Model terbaik (dari fold {best_fold+1}) disimpan ke {model_path}")
+                        
+                        # Evaluate on test set
+                        st.subheader("Evaluasi Model pada Test Set")
+                        
+                        best_model.eval()
+                        all_preds = []
+                        all_labels = []
                         
                         with torch.no_grad():
-                            for inputs, labels in val_loader:
+                            for inputs, labels in test_loader:
+                                outputs = best_model(inputs)
+                                _, preds = torch.max(outputs, 1)
+                                all_preds.extend(preds.numpy())
+                                all_labels.extend(labels.numpy())
+                        
+                        # Confusion matrix
+                        cm = confusion_matrix(all_labels, all_preds)
+                        class_names = ['Jawa', 'Batak', 'Sunda']
+                        
+                        fig, ax = plt.subplots(figsize=(8, 6))
+                        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+                        plt.xlabel("Predicted")
+                        plt.ylabel("True")
+                        plt.title("Confusion Matrix")
+                        st.pyplot(fig)
+                        
+                        # Classification report
+                        report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
+                        report_df = pd.DataFrame(report).transpose()
+                        st.write("Classification Report:")
+                        st.dataframe(report_df)
+                    
+                    else:
+                        # Standard training (no CV)
+                        # Inisialisasi model
+                        model = initialize_ethnic_model(num_classes=3, dropout_rate=dropout_rate)
+                        
+                        # Loss function dan optimizer
+                        criterion = nn.CrossEntropyLoss()
+                        optimizer = optim.Adam(
+                            model.parameters(), 
+                            lr=learning_rate, 
+                            weight_decay=weight_decay
+                        )
+                        
+                        # Learning rate scheduler
+                        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                            optimizer, 'min', patience=2, factor=scheduler_factor
+                        ) if use_lr_scheduler else None
+                        
+                        # Training loop
+                        train_losses = []
+                        val_losses = []
+                        train_accs = []
+                        val_accs = []
+                        
+                        # Progress bar dan status
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        metrics_text = st.empty()
+                        loss_chart = st.empty()
+                        
+                        # Early stopping variables
+                        best_val_loss = float('inf')
+                        no_improve_epochs = 0
+                        best_model_weights = None
+                        
+                        # Function to update loss chart
+                        def update_loss_chart(train_losses, val_losses, train_accs, val_accs, current_lr):
+                            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+                            
+                            ax1.plot(train_losses, label='Train Loss')
+                            ax1.plot(val_losses, label='Validation Loss')
+                            ax1.set_xlabel('Epochs')
+                            ax1.set_ylabel('Loss')
+                            ax1.set_title(f'Training and Validation Loss (LR: {current_lr:.6f})')
+                            ax1.legend()
+                            ax1.grid(True)
+                            
+                            ax2.plot(train_accs, label='Train Accuracy')
+                            ax2.plot(val_accs, label='Validation Accuracy')
+                            ax2.set_xlabel('Epochs')
+                            ax2.set_ylabel('Accuracy')
+                            ax2.set_title('Training and Validation Accuracy')
+                            ax2.legend()
+                            ax2.grid(True)
+                            
+                            return fig
+                        
+                        # Training loop
+                        for epoch in range(epochs):
+                            status_text.text(f"Epoch {epoch+1}/{epochs}")
+                            
+                            # Training phase
+                            model.train()
+                            running_train_loss = 0.0
+                            running_train_corrects = 0
+                            train_samples = 0
+                            
+                            for inputs, labels in train_loader:
+                                optimizer.zero_grad()
                                 outputs = model(inputs)
                                 loss = criterion(outputs, labels)
+                                loss.backward()
+                                optimizer.step()
                                 
-                                running_val_loss += loss.item() * inputs.size(0)
+                                running_train_loss += loss.item() * inputs.size(0)
                                 _, preds = torch.max(outputs, 1)
-                                running_val_corrects += torch.sum(preds == labels.data)
-                                val_samples += labels.size(0)
+                                running_train_corrects += torch.sum(preds == labels.data)
+                                train_samples += labels.size(0)
+                            
+                            epoch_train_loss = running_train_loss / train_samples
+                            epoch_train_acc = running_train_corrects.double() / train_samples
+                            
+                            # Validation phase
+                            model.eval()
+                            running_val_loss = 0.0
+                            running_val_corrects = 0
+                            val_samples = 0
+                            
+                            with torch.no_grad():
+                                for inputs, labels in val_loader:
+                                    outputs = model(inputs)
+                                    loss = criterion(outputs, labels)
+                                    
+                                    running_val_loss += loss.item() * inputs.size(0)
+                                    _, preds = torch.max(outputs, 1)
+                                    running_val_corrects += torch.sum(preds == labels.data)
+                                    val_samples += labels.size(0)
+                            
+                            epoch_val_loss = running_val_loss / val_samples
+                            epoch_val_acc = running_val_corrects.double() / val_samples
+                            
+                            # Update metrics
+                            train_losses.append(epoch_train_loss)
+                            val_losses.append(epoch_val_loss)
+                            train_accs.append(epoch_train_acc.item())
+                            val_accs.append(epoch_val_acc.item())
+                            
+                            # Update scheduler if used
+                            if scheduler:
+                                scheduler.step(epoch_val_loss)
+                                current_lr = optimizer.param_groups[0]['lr']
+                            else:
+                                current_lr = learning_rate
+                            
+                            # Early stopping check
+                            if use_early_stopping:
+                                if epoch_val_loss < best_val_loss:
+                                    best_val_loss = epoch_val_loss
+                                    no_improve_epochs = 0
+                                    best_model_weights = model.state_dict().copy()
+                                else:
+                                    no_improve_epochs += 1
+                                    if no_improve_epochs >= patience:
+                                        status_text.text(f"Early stopping triggered at epoch {epoch+1}/{epochs}")
+                                        break
+                            
+                            # Update UI
+                            progress_bar.progress((epoch + 1) / epochs)
+                            metrics_text.text(f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.4f}, "
+                                            f"Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.4f}, "
+                                            f"LR: {current_lr:.6f}")
+                            
+                            # Update loss chart every few epochs
+                            if (epoch + 1) % 2 == 0 or epoch == 0 or epoch == epochs - 1:
+                                loss_chart.pyplot(update_loss_chart(train_losses, val_losses, train_accs, val_accs, current_lr))
                         
-                        epoch_val_loss = running_val_loss / val_samples
-                        epoch_val_acc = running_val_corrects.double() / val_samples
+                        # Selesai training
+                        status_text.text("Training selesai!")
                         
-                        # Update metrics
-                        train_losses.append(epoch_train_loss)
-                        val_losses.append(epoch_val_loss)
-                        train_accs.append(epoch_train_acc.item())
-                        val_accs.append(epoch_val_acc.item())
+                        # Use best model if early stopping was enabled
+                        if use_early_stopping and best_model_weights:
+                            model.load_state_dict(best_model_weights)
+                            st.success("Menggunakan model terbaik dari early stopping")
                         
-                        # Update UI
-                        progress_bar.progress((epoch + 1) / epochs)
-                        metrics_text.text(f"Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.4f}, "
-                                          f"Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.4f}")
+                        # Simpan model
+                        torch.save(model.state_dict(), str(model_path))
+                        st.success(f"Model berhasil disimpan ke {model_path}")
                         
-                        # Update loss chart every few epochs
-                        if (epoch + 1) % 2 == 0 or epoch == 0 or epoch == epochs - 1:
-                            loss_chart.pyplot(update_loss_chart(train_losses, val_losses, train_accs, val_accs))
-                    
-                    # Selesai training
-                    status_text.text("Training selesai!")
-                    
-                    # Simpan model
-                    torch.save(model.state_dict(), str(model_path))
-                    st.success(f"Model berhasil disimpan ke {model_path}")
-                    
-                    # Evaluasi model pada test set
-                    st.subheader("Evaluasi Model pada Test Set")
-                    
-                    model.eval()
-                    all_preds = []
-                    all_labels = []
-                    
-                    with torch.no_grad():
-                        for inputs, labels in test_loader:
-                            outputs = model(inputs)
-                            _, preds = torch.max(outputs, 1)
-                            all_preds.extend(preds.numpy())
-                            all_labels.extend(labels.numpy())
-                    
-                    # Confusion matrix
-                    cm = confusion_matrix(all_labels, all_preds)
-                    class_names = ['Jawa', 'Batak', 'Sunda']
-                    
-                    fig, ax = plt.subplots(figsize=(8, 6))
-                    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
-                    plt.xlabel("Predicted")
-                    plt.ylabel("True")
-                    plt.title("Confusion Matrix")
-                    st.pyplot(fig)
-                    
-                    # Classification report
-                    report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
-                    report_df = pd.DataFrame(report).transpose()
-                    st.write("Classification Report:")
-                    st.dataframe(report_df)
+                        # Evaluasi model pada test set
+                        st.subheader("Evaluasi Model pada Test Set")
+                        
+                        model.eval()
+                        all_preds = []
+                        all_labels = []
+                        
+                        with torch.no_grad():
+                            for inputs, labels in test_loader:
+                                outputs = model(inputs)
+                                _, preds = torch.max(outputs, 1)
+                                all_preds.extend(preds.numpy())
+                                all_labels.extend(labels.numpy())
+                        
+                        # Confusion matrix
+                        cm = confusion_matrix(all_labels, all_preds)
+                        class_names = ['Jawa', 'Batak', 'Sunda']
+                        
+                        fig, ax = plt.subplots(figsize=(8, 6))
+                        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names)
+                        plt.xlabel("Predicted")
+                        plt.ylabel("True")
+                        plt.title("Confusion Matrix")
+                        st.pyplot(fig)
+                        
+                        # Classification report
+                        report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
+                        report_df = pd.DataFrame(report).transpose()
+                        st.write("Classification Report:")
+                        st.dataframe(report_df)
         
         with tab2:
             st.subheader("Prediksi Suku/Etnis")
             
             # Initialize face detector
             detector = load_face_detector()
+            shape_analyzer = ShapeAnalyzer()
             
             # Check if model exists
             if not model_path.exists():
@@ -869,20 +1207,24 @@ def main():
             else:
                 import torch 
                 from torch import nn
-                from torchvision import models, transforms
+                from torchvision import models
     
-                # Load model
-                model = models.resnet18(pretrained=False)
-                model.fc = nn.Linear(model.fc.in_features, 3)  # 3 kelas: Jawa, Batak, Sunda
+                # Load model - improved architecture
+                model = initialize_ethnic_model(num_classes=3, dropout_rate=0.5)
                 model.load_state_dict(torch.load(str(model_path)))
                 model.eval()
                 
-                # Define preprocessing for prediction
-                preprocess = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                ])
+                # Get consistent transform for inference
+                inference_transform, _ = create_consistent_transforms()
+                
+                # Confidence threshold slider
+                confidence_threshold = st.slider(
+                    "Threshold Confidence", 
+                    min_value=0.0, 
+                    max_value=1.0, 
+                    value=0.6,
+                    help="Nilai minimum confidence untuk memberikan prediksi"
+                )
                 
                 # Upload image
                 uploaded_file = st.file_uploader("Upload gambar wajah", type=["jpg", "jpeg", "png"])
@@ -896,35 +1238,43 @@ def main():
                     img_array = np.array(image)
                     img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
                     
-                    # Detect face
-                    with st.spinner("Mendeteksi wajah..."):
-                        faces = detector.detect_faces(img_array)
+                    # Detect face and align
+                    with st.spinner("Mendeteksi dan menyelaraskan wajah..."):
+                        aligned_face, face_data = detect_crop_and_align_face(img_cv, detector)
                     
-                    if not faces:
+                    if aligned_face is None:
                         st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
                     else:
-                        # Get first face
-                        face = faces[0]
-                        x, y, w, h = face['box']
-                        face_img_cv = img_cv[y:y+h, x:x+w]
-                        face_img = Image.fromarray(cv2.cvtColor(face_img_cv, cv2.COLOR_BGR2RGB))
+                        # Show aligned face
+                        st.image(cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB), caption="Wajah Terdeteksi & Disejajarkan", width=200)
                         
-                        # Show cropped face
-                        st.image(face_img, caption="Wajah Terdeteksi", width=200)
+                        # Extract shape features for additional analysis
+                        shape_metrics = shape_analyzer.analyze_facial_shape(aligned_face)
                         
-                        # Preprocess for model
-                        input_tensor = preprocess(face_img).unsqueeze(0)
+                        # Convert to PIL for model
+                        aligned_pil = Image.fromarray(cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB))
+                        
+                        # Preprocess with consistent transform
+                        input_tensor = inference_transform(aligned_pil).unsqueeze(0)
                         
                         # Predict
                         with st.spinner("Memprediksi suku/etnis..."):
                             with torch.no_grad():
                                 output = model(input_tensor)
                                 probabilities = torch.nn.functional.softmax(output, dim=1)[0]
-                                predicted_idx = torch.argmax(probabilities).item()
                                 
                                 class_names = ['Jawa', 'Batak', 'Sunda']
+                                predicted_idx = torch.argmax(probabilities).item()
                                 predicted_class = class_names[predicted_idx]
                                 confidence = {class_names[i]: float(probabilities[i]) for i in range(len(class_names))}
+                        
+                        # Get maximum confidence
+                        max_confidence = max(confidence.values())
+                        
+                        # Check if confidence is above threshold
+                        if max_confidence < confidence_threshold:
+                            st.warning(f"Confidence terlalu rendah ({max_confidence:.2f} < {confidence_threshold:.2f}). Tidak dapat menentukan etnis dengan yakin.")
+                            predicted_class = "Tidak dapat ditentukan"
                         
                         # Show prediction
                         st.subheader(f"Prediksi: {predicted_class}")
@@ -946,14 +1296,81 @@ def main():
                         
                         st.pyplot(fig)
                         
-                        # Interpretation
-                        max_confidence = max(confidence.values())
-                        if max_confidence > 0.7:
-                            st.success(f"Wajah ini diprediksi sebagai suku {predicted_class} dengan confidence yang tinggi ({max_confidence:.2f}).")
-                        elif max_confidence > 0.4:
-                            st.info(f"Wajah ini diprediksi sebagai suku {predicted_class}, tetapi confidence cukup rendah ({max_confidence:.2f}).")
+                        # Interpretation based on threshold
+                        if max_confidence >= confidence_threshold:
+                            if max_confidence > 0.7:
+                                st.success(f"Wajah ini diprediksi sebagai suku {predicted_class} dengan confidence yang tinggi ({max_confidence:.2f}).")
+                            elif max_confidence > 0.4:
+                                st.info(f"Wajah ini diprediksi sebagai suku {predicted_class}, tetapi confidence cukup rendah ({max_confidence:.2f}).")
+                        
+                        # Show shape analysis
+                        st.subheader("Analisis Bentuk Wajah")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric("Aspect Ratio", f"{shape_metrics['aspect_ratio']:.3f}")
+                            st.metric("Circularity", f"{shape_metrics['circularity']:.3f}")
+                        with col2:
+                            st.metric("Convexity", f"{shape_metrics['convexity']:.3f}")
+                            st.metric("Area", f"{shape_metrics['area']:.0f} piksel²")
+                        
+                        # Correlation of shape metrics with ethnicity
+                        st.subheader("Korelasi Bentuk Wajah dengan Etnis")
+                        
+                        aspect_ratio = shape_metrics['aspect_ratio']
+                        circularity = shape_metrics['circularity']
+                        convexity = shape_metrics['convexity']
+                        
+                        # Insights based on shape metrics
+                        st.write("### Analisis Korelasi Bentuk Wajah dan Etnisitas")
+                        
+                        # General patterns (simplified approximations for demonstration)
+                        if predicted_class == "Jawa":
+                            ar_match = aspect_ratio > 0.9
+                            circ_match = circularity > 0.7
+                            conv_match = convexity > 0.9
+                        elif predicted_class == "Batak":
+                            ar_match = aspect_ratio < 0.88
+                            circ_match = circularity < 0.7
+                            conv_match = convexity < 0.9
+                        else:  # Sunda
+                            ar_match = 0.88 <= aspect_ratio <= 0.92
+                            circ_match = 0.68 <= circularity <= 0.75
+                            conv_match = 0.88 <= convexity <= 0.93
+                        
+                        # Show correlation indicators
+                        metric_col1, metric_col2, metric_col3 = st.columns(3)
+                        
+                        with metric_col1:
+                            st.write(f"**Aspect Ratio**: {'✓' if ar_match else '✗'}")
+                            if ar_match:
+                                st.success(f"Rasio aspek {aspect_ratio:.2f} konsisten dengan karakteristik wajah {predicted_class}")
+                            else:
+                                st.info(f"Rasio aspek {aspect_ratio:.2f} kurang konsisten dengan karakteristik wajah {predicted_class}")
+                        
+                        with metric_col2:
+                            st.write(f"**Circularity**: {'✓' if circ_match else '✗'}")
+                            if circ_match:
+                                st.success(f"Sirkularitas {circularity:.2f} konsisten dengan karakteristik wajah {predicted_class}")
+                            else:
+                                st.info(f"Sirkularitas {circularity:.2f} kurang konsisten dengan karakteristik wajah {predicted_class}")
+                        
+                        with metric_col3:
+                            st.write(f"**Convexity**: {'✓' if conv_match else '✗'}")
+                            if conv_match:
+                                st.success(f"Konveksitas {convexity:.2f} konsisten dengan karakteristik wajah {predicted_class}")
+                            else:
+                                st.info(f"Konveksitas {convexity:.2f} kurang konsisten dengan karakteristik wajah {predicted_class}")
+                        
+                        # Overall shape consistency indicator
+                        consistency_score = sum([ar_match, circ_match, conv_match])
+                        
+                        if consistency_score >= 2:
+                            st.success(f"Karakteristik bentuk wajah secara umum konsisten dengan etnis {predicted_class}")
                         else:
-                            st.warning(f"Sistem tidak dapat memprediksi suku dengan confidence yang tinggi. Confidence tertinggi adalah {predicted_class} ({max_confidence:.2f}).")
+                            st.warning(f"Karakteristik bentuk wajah kurang konsisten dengan etnis {predicted_class}, kemungkinan ada ambiguitas")
+                        
+                        # Disclaimer
+                        st.info("Catatan: Analisis korelasi ini didasarkan pada pola bentuk wajah yang diamati dalam dataset terbatas. Variabilitas individu sangat besar dalam setiap kelompok etnis, dan analisis ini hanya bersifat indikatif.")
     
     elif app_mode == "Analisis Bentuk Wajah":
         st.header("Analisis Bentuk Wajah Menggunakan Metode Komputer Vision")
@@ -977,7 +1394,7 @@ def main():
             image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
             
             # Create tabs for different analyses
-            tab1, tab2, tab3 = st.tabs(["Analisis Kontur", "Deteksi Tepi", "Proyeksi Integral"])
+            tab1, tab2, tab3, tab4 = st.tabs(["Analisis Kontur", "Deteksi Tepi", "Proyeksi Integral", "Dashboard Bentuk"])
             
             with tab1:
                 st.subheader("Analisis Kontur Wajah dengan Kode Rantai")
@@ -988,20 +1405,19 @@ def main():
                 faces = detector.detect_faces(img_rgb)
                 
                 if faces:
-                    face = faces[0]
-                    x, y, w, h = face['box']
-                    face_img = image[y:y+h, x:x+w]
+                    # Get aligned face
+                    aligned_face, _ = detect_crop_and_align_face(image, detector)
                     
                     # Show original face
-                    st.image(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB), caption="Wajah Terdeteksi")
+                    st.image(cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB), caption="Wajah Terdeteksi & Disejajarkan")
                     
                     # Generate contour visualization
                     with st.spinner("Menganalisis kontur wajah..."):
-                        fig = shape_analyzer.visualize_contour_analysis(face_img)
+                        fig = shape_analyzer.visualize_contour_analysis(aligned_face)
                         st.pyplot(fig)
                         
                     # Show shape metrics
-                    metrics = shape_analyzer.analyze_facial_shape(face_img)
+                    metrics = shape_analyzer.analyze_facial_shape(aligned_face)
                     st.write("### Metrik Bentuk Wajah")
                     
                     col1, col2 = st.columns(2)
@@ -1012,6 +1428,75 @@ def main():
                     with col2:
                         st.metric("Convexity", f"{metrics['convexity']:.3f}")
                         st.metric("Area", f"{metrics['area']:.0f} piksel²")
+                    
+                    # Interpretation
+                    st.subheader("Interpretasi")
+                    
+                    aspect_ratio = metrics['aspect_ratio']
+                    circularity = metrics['circularity']
+                    
+                    st.write("**Aspect Ratio**:", end=" ")
+                    if aspect_ratio > 0.95:
+                        st.write("Wajah cenderung bulat/persegi")
+                    elif aspect_ratio > 0.85:
+                        st.write("Wajah cenderung oval")
+                    else:
+                        st.write("Wajah cenderung memanjang")
+                    
+                    st.write("**Circularity**:", end=" ")
+                    if circularity > 0.8:
+                        st.write("Bentuk wajah sangat regular/bulat")
+                    elif circularity > 0.7:
+                        st.write("Bentuk wajah cukup regular")
+                    else:
+                        st.write("Bentuk wajah memiliki variasi kontur yang tinggi")
+                    
+                    # Chain code analysis
+                    chain_code = shape_analyzer.generate_freeman_chain_code(
+                        shape_analyzer.extract_face_contour(aligned_face)
+                    )
+                    
+                    if chain_code:
+                        # Calculate frequency of each direction
+                        dir_freq = {i: chain_code.count(i) for i in range(8)}
+                        
+                        st.subheader("Analisis Distribusi Arah Kontur")
+                        
+                        # Plot direction frequency
+                        dir_fig, dir_ax = plt.subplots(figsize=(10, 6))
+                        bars = dir_ax.bar(dir_freq.keys(), dir_freq.values(), color='skyblue')
+                        dir_ax.set_xlabel('Arah Kode Rantai (0-7)')
+                        dir_ax.set_ylabel('Frekuensi')
+                        dir_ax.set_title('Distribusi Arah Kontur')
+                        dir_ax.set_xticks(range(8))
+                        
+                        # Add percentage labels
+                        total = sum(dir_freq.values())
+                        for bar in bars:
+                            height = bar.get_height()
+                            percentage = height/total*100 if total > 0 else 0
+                            dir_ax.text(bar.get_x() + bar.get_width()/2., height,
+                                    f'{percentage:.1f}%', ha='center', va='bottom')
+                        
+                        st.pyplot(dir_fig)
+                        
+                        # Interpret direction distribution
+                        horizontal_dirs = dir_freq.get(0, 0) + dir_freq.get(4, 0)
+                        vertical_dirs = dir_freq.get(2, 0) + dir_freq.get(6, 0)
+                        diagonal_dirs = dir_freq.get(1, 0) + dir_freq.get(3, 0) + dir_freq.get(5, 0) + dir_freq.get(7, 0)
+                        
+                        st.write(f"**Proporsi Arah Horizontal**: {horizontal_dirs/total*100:.1f}%")
+                        st.write(f"**Proporsi Arah Vertikal**: {vertical_dirs/total*100:.1f}%")
+                        st.write(f"**Proporsi Arah Diagonal**: {diagonal_dirs/total*100:.1f}%")
+                        
+                        # Interpretation
+                        if horizontal_dirs > vertical_dirs:
+                            st.write("Dominasi arah horizontal menunjukkan bentuk wajah yang cenderung lebih lebar.")
+                        else:
+                            st.write("Dominasi arah vertikal menunjukkan bentuk wajah yang cenderung lebih memanjang.")
+                        
+                        if diagonal_dirs > (horizontal_dirs + vertical_dirs):
+                            st.write("Proporsi arah diagonal yang tinggi menunjukkan kontur wajah dengan banyak lekukan atau fitur angular.")
                 else:
                     st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
             
@@ -1028,13 +1513,12 @@ def main():
                 faces = detector.detect_faces(img_rgb)
                 
                 if faces:
-                    face = faces[0]
-                    x, y, w, h = face['box']
-                    face_img = image[y:y+h, x:x+w]
+                    # Get aligned face
+                    aligned_face, _ = detect_crop_and_align_face(image, detector)
                     
                     # Generate edge visualization
                     with st.spinner("Mendeteksi tepi wajah..."):
-                        fig = shape_analyzer.visualize_edges(face_img, low_threshold, high_threshold)
+                        fig = shape_analyzer.visualize_edges(aligned_face, low_threshold, high_threshold)
                         st.pyplot(fig)
                     
                     # Explanation
@@ -1044,6 +1528,22 @@ def main():
                     - **Threshold Atas**: Pixel dengan gradient di atas nilai ini selalu dianggap sebagai tepi
                     - Pixel antara kedua threshold ini dianggap tepi jika terhubung dengan tepi yang pasti
                     """)
+                    
+                    # Edge density analysis
+                    edges = shape_analyzer.detect_edges(aligned_face, low_threshold, high_threshold)
+                    edge_density = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1])
+                    
+                    st.subheader("Analisis Kepadatan Tepi")
+                    st.metric("Kepadatan Tepi", f"{edge_density:.4f}")
+                    
+                    # Interpretation
+                    st.write("**Interpretasi Kepadatan Tepi**:")
+                    if edge_density > 0.15:
+                        st.write("Kepadatan tepi tinggi menunjukkan wajah dengan banyak fitur tekstur dan detail.")
+                    elif edge_density > 0.08:
+                        st.write("Kepadatan tepi medium menunjukkan fitur wajah yang cukup menonjol dengan tekstur moderat.")
+                    else:
+                        st.write("Kepadatan tepi rendah menunjukkan wajah dengan fitur halus dan sedikit detil tekstur.")
                 else:
                     st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
             
@@ -1056,24 +1556,231 @@ def main():
                 faces = detector.detect_faces(img_rgb)
                 
                 if faces:
-                    face = faces[0]
-                    x, y, w, h = face['box']
-                    face_img = image[y:y+h, x:x+w]
+                    # Get aligned face
+                    aligned_face, _ = detect_crop_and_align_face(image, detector)
                     
                     # Generate projections visualization
                     with st.spinner("Menghitung proyeksi integral..."):
-                        fig = shape_analyzer.visualize_projections(face_img)
+                        fig = shape_analyzer.visualize_projections(aligned_face)
                         st.pyplot(fig)
                     
-                    # Explanation
+                    # Get projection data
+                    h_proj, v_proj = shape_analyzer.calculate_projections(aligned_face)
+                    
+                    # Advanced analysis of projections
+                    st.subheader("Analisis Proyeksi Lanjutan")
+                    
+                    # Calculate statistics
+                    h_mean = np.mean(h_proj)
+                    h_std = np.std(h_proj)
+                    h_max = np.max(h_proj)
+                    h_peak_loc = np.argmax(h_proj) / len(h_proj)
+                    
+                    v_mean = np.mean(v_proj)
+                    v_std = np.std(v_proj)
+                    v_max = np.max(v_proj)
+                    v_peak_loc = np.argmax(v_proj) / len(v_proj)
+                    
+                    # Display statistics
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write("**Proyeksi Horizontal (Profil Vertikal)**")
+                        st.metric("Nilai Rata-rata", f"{h_mean:.2f}")
+                        st.metric("Standar Deviasi", f"{h_std:.2f}")
+                        st.metric("Lokasi Relatif Puncak", f"{h_peak_loc:.2f}")
+                    
+                    with col2:
+                        st.write("**Proyeksi Vertikal (Profil Horizontal)**")
+                        st.metric("Nilai Rata-rata", f"{v_mean:.2f}")
+                        st.metric("Standar Deviasi", f"{v_std:.2f}")
+                        st.metric("Lokasi Relatif Puncak", f"{v_peak_loc:.2f}")
+                    
+                    # Interpretation
+                    st.subheader("Interpretasi Proyeksi")
+                    
+                    st.write("**Distribusi Fitur Horizontal:**")
+                    if h_std / h_mean > 0.5:
+                        st.write("Variasi tinggi pada profil horizontal menunjukkan fitur wajah yang sangat berbeda antar kolom (seperti batas wajah yang tajam).")
+                    else:
+                        st.write("Variasi rendah pada profil horizontal menunjukkan fitur wajah yang lebih merata secara horizontal.")
+                    
+                    st.write("**Distribusi Fitur Vertikal:**")
+                    if v_std / v_mean > 0.5:
+                        st.write("Variasi tinggi pada profil vertikal menunjukkan fitur wajah yang terdistribusi tidak merata secara vertikal.")
+                    else:
+                        st.write("Variasi rendah pada profil vertikal menunjukkan fitur wajah yang terdistribusi merata secara vertikal.")
+                    
+                    st.write("**Lokasi Puncak:**")
+                    if 0.45 <= h_peak_loc <= 0.55:
+                        st.write("Puncak horizontal di tengah menunjukkan wajah yang simetris secara horizontal.")
+                    else:
+                        st.write("Puncak horizontal tidak di tengah menunjukkan kemungkinan asimetri atau pose miring.")
+                else:
+                    st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
+            
+            with tab4:
+                st.subheader("Dashboard Karakteristik Bentuk Wajah")
+                
+                # Detect face
+                detector = load_face_detector()
+                img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                faces = detector.detect_faces(img_rgb)
+                
+                if faces:
+                    # Get aligned face
+                    aligned_face, _ = detect_crop_and_align_face(image, detector)
+                    
+                    # Show aligned face
+                    st.image(cv2.cvtColor(aligned_face, cv2.COLOR_BGR2RGB), caption="Wajah Terdeteksi & Disejajarkan", width=300)
+                    
+                    # Get all metrics
+                    shape_metrics = shape_analyzer.analyze_facial_shape(aligned_face)
+                    edges = shape_analyzer.detect_edges(aligned_face, 50, 150)
+                    edge_density = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1])
+                    h_proj, v_proj = shape_analyzer.calculate_projections(aligned_face)
+                    
+                    # Calculate derived metrics
+                    h_std_rel = np.std(h_proj) / np.mean(h_proj) if np.mean(h_proj) > 0 else 0
+                    v_std_rel = np.std(v_proj) / np.mean(v_proj) if np.mean(v_proj) > 0 else 0
+                    
+                    # Display comprehensive dashboard
+                    st.subheader("Metrik Bentuk Komprehensif")
+                    
+                    # Create 3 columns for metrics
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.write("**Metrik Geometri**")
+                        st.metric("Aspect Ratio", f"{shape_metrics['aspect_ratio']:.3f}")
+                        st.metric("Circularity", f"{shape_metrics['circularity']:.3f}")
+                        st.metric("Convexity", f"{shape_metrics['convexity']:.3f}")
+                    
+                    with col2:
+                        st.write("**Metrik Tekstur**")
+                        st.metric("Kepadatan Tepi", f"{edge_density:.3f}")
+                        st.metric("Area (piksel²)", f"{shape_metrics['area']:.0f}")
+                        st.metric("Perimeter (piksel)", f"{shape_metrics['perimeter']:.0f}")
+                    
+                    with col3:
+                        st.write("**Metrik Distribusi**")
+                        st.metric("Var. Horizontal Rel.", f"{h_std_rel:.3f}")
+                        st.metric("Var. Vertikal Rel.", f"{v_std_rel:.3f}")
+                        st.metric("Rasio Perimeter/Area", f"{shape_metrics['perimeter']/shape_metrics['area']:.5f}")
+                    
+                    # Radar chart for visualization
+                    st.subheader("Profil Bentuk Wajah")
+                    
+                    # Normalize metrics for radar chart
+                    metrics_for_radar = {
+                        'Aspect Ratio': min(1.0, shape_metrics['aspect_ratio']),
+                        'Circularity': shape_metrics['circularity'],
+                        'Convexity': shape_metrics['convexity'],
+                        'Edge Density': min(1.0, edge_density * 5),  # Scale up for visibility
+                        'H. Variation': min(1.0, h_std_rel),
+                        'V. Variation': min(1.0, v_std_rel)
+                    }
+                    
+                    # Get values and labels
+                    categories = list(metrics_for_radar.keys())
+                    values = list(metrics_for_radar.values())
+                    
+                    # Create radar chart
+                    N = len(categories)
+                    angles = [n / float(N) * 2 * np.pi for n in range(N)]
+                    angles += angles[:1]  # Close the loop
+                    
+                    values += values[:1]  # Close the loop
+                    
+                    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+                    
+                    plt.xticks(angles[:-1], categories, size=12)
+                    ax.set_rlabel_position(0)
+                    plt.yticks([0.25, 0.5, 0.75, 1], ["0.25", "0.5", "0.75", "1.0"], 
+                              color="grey", size=10)
+                    plt.ylim(0, 1)
+                    
+                    ax.plot(angles, values, linewidth=2, linestyle='solid')
+                    ax.fill(angles, values, 'skyblue', alpha=0.4)
+                    
+                    plt.title("Radar Chart Karakteristik Bentuk Wajah", size=15, y=1.1)
+                    
+                    st.pyplot(fig)
+                    
+                    # Interpretation and ethnic correlation
+                    st.subheader("Interpretasi Karakteristik dan Korelasi Etnis")
+                    
+                    aspect_ratio = shape_metrics['aspect_ratio']
+                    circularity = shape_metrics['circularity']
+                    convexity = shape_metrics['convexity']
+                    
+                    # Estimate ethnicity based on simplified shape metrics
+                    ethnicity_scores = {
+                        'Jawa': 0,
+                        'Batak': 0,
+                        'Sunda': 0
+                    }
+                    
+                    # Score calculation based on aspect ratio
+                    if aspect_ratio > 0.92:
+                        ethnicity_scores['Jawa'] += 2
+                        ethnicity_scores['Sunda'] += 1
+                    elif aspect_ratio < 0.86:
+                        ethnicity_scores['Batak'] += 2
+                    else:
+                        ethnicity_scores['Sunda'] += 2
+                        ethnicity_scores['Jawa'] += 1
+                    
+                    # Score calculation based on circularity
+                    if circularity > 0.75:
+                        ethnicity_scores['Jawa'] += 2
+                    elif circularity < 0.68:
+                        ethnicity_scores['Batak'] += 2
+                    else:
+                        ethnicity_scores['Sunda'] += 2
+                        ethnicity_scores['Batak'] += 1
+                    
+                    # Score calculation based on convexity
+                    if convexity > 0.92:
+                        ethnicity_scores['Jawa'] += 2
+                    elif convexity < 0.88:
+                        ethnicity_scores['Batak'] += 2
+                    else:
+                        ethnicity_scores['Sunda'] += 2
+                        ethnicity_scores['Jawa'] += 1
+                    
+                    # Display ethnicity correlation
+                    st.write("Berdasarkan analisis bentuk, karakteristik wajah menunjukkan korelasi dengan etnis berikut:")
+                    
+                    # Create bar chart
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    bars = ax.bar(ethnicity_scores.keys(), ethnicity_scores.values(), 
+                                 color=['#FF9999', '#66B2FF', '#99FF99'])
+                    ax.set_ylabel('Skor Korelasi')
+                    ax.set_title('Korelasi Bentuk Wajah dengan Etnis')
+                    
+                    # Add values on top of bars
+                    for bar in bars:
+                        height = bar.get_height()
+                        ax.text(bar.get_x() + bar.get_width()/2., height,
+                               f'{height:.1f}', ha='center', va='bottom')
+                    
+                    st.pyplot(fig)
+                    
+                    # Final interpretation
+                    max_score_ethnicity = max(ethnicity_scores, key=ethnicity_scores.get)
+                    
+                    st.write(f"**Bentuk wajah menunjukkan karakteristik yang paling berkorelasi dengan etnis {max_score_ethnicity}**")
+                    
                     st.info("""
-                    **Tentang Proyeksi Integral:**
-                    - **Proyeksi Horizontal**: Menunjukkan distribusi piksel sepanjang sumbu X (fitur vertikal)
-                    - **Proyeksi Vertikal**: Menunjukkan distribusi piksel sepanjang sumbu Y (fitur horizontal)
-                    - Berguna untuk mengidentifikasi garis-garis fitur utama pada wajah
+                    **Catatan Penting**: Analisis ini bersifat indikatif dan didasarkan pada pola bentuk wajah yang diamati 
+                    dalam dataset terbatas. Korelasi ini tidak deterministik dan terdapat variabilitas individual yang besar 
+                    dalam setiap kelompok etnis. Analisis ini tidak boleh digunakan untuk kategorisasi deterministik 
+                    dan hanya sebagai pendekatan pendukung untuk analisis visual.
                     """)
                 else:
                     st.error("Tidak dapat mendeteksi wajah pada gambar. Silakan coba gambar lain.")
+
 
     # ========== ABOUT PAGE ==========
     elif app_mode == "Tentang":

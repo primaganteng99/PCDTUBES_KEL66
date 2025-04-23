@@ -95,17 +95,18 @@ def load_datasets_and_create_loaders(train_transform, val_test_transform):
     return train_loader, val_loader, test_loader, class_names
 
 def initialize_model():
-    """Inisialisasi model ResNet18 dengan transfer learning"""
+        # Saat inisialisasi model dalam tab Training
     model = models.resnet18(pretrained=True)
-    
-    # Freeze all layers except last few
-    for param in list(model.parameters())[:-10]:
-        param.requires_grad = False
-    
-    # Replace the final fully connected layer
-    model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
-    
-    return model.to(DEVICE)
+
+    # Unfreeze beberapa layer sebelum layer4
+    for param in model.layer4.parameters():
+        param.requires_grad = True
+
+    # Tambahkan dropout untuk regularisasi
+    model.fc = nn.Sequential(
+        nn.Dropout(0.5),  # Dropout untuk regularisasi
+        nn.Linear(model.fc.in_features, 3)  # 3 kelas: Jawa, Batak, Sunda
+    )
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs):
     """Train model dan evaluasi pada validation set"""
